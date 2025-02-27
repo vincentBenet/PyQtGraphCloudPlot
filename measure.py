@@ -1,13 +1,185 @@
-
 import pyqtgraph
 import numpy
-from pyqtgraph.Qt import QtCore
+from pyqtgraph.Qt import QtCore, QtGui
+import threading
+import queue
+import time
+import weakref
 
 import slice
 
 
+class OptimizationWorker(QtCore.QObject):
+    # Signal to pass results back to the main thread
+    result_ready = QtCore.Signal(object)
+
+    def __init__(self):
+        super().__init__()
+        self.task_queue = queue.Queue()
+        self.measures_ref = None  # Weak reference to measures object
+        self.running = True
+        self.thread = threading.Thread(target=self._process_queue, daemon=True)
+        self.thread.start()
+
+    def set_measures(self, measures):
+        """Set a weak reference to the measures object"""
+        self.measures_ref = weakref.ref(measures)
+
+    def add_task(self, view_range):
+        """Add a task to the queue"""
+        # Clear the queue first to avoid outdated tasks
+        while not self.task_queue.empty():
+            try:
+                self.task_queue.get_nowait()
+                self.task_queue.task_done()
+            except queue.Empty:
+                break
+        self.task_queue.put(view_range)
+
+    def _process_queue(self):
+        """Process tasks from the queue"""
+        while self.running:
+            try:
+                # Get task with timeout to allow checking running flag periodically
+                try:
+                    view_range = self.task_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                # Get measures object from weak reference
+                measures = self.measures_ref() if self.measures_ref else None
+                if measures is None:
+                    self.task_queue.task_done()
+                    continue
+
+                try:
+                    # Extract view boundaries
+                    x_range, y_range = view_range
+                    x_min, x_max = x_range
+                    y_min, y_max = y_range
+
+                    # Get data from the measures object
+                    x = measures.x
+                    y = measures.y
+                    all_points_idx = measures.all_points_idx
+
+                    # Filter points that are within view bounds
+                    in_view = (
+                            (x >= x_min) & (x <= x_max) &
+                            (y >= y_min) & (y <= y_max)
+                    )
+                    points_in_view = all_points_idx[in_view]
+
+                    # Quick exit for small datasets
+                    if len(points_in_view) < 1000:
+                        result = {'visible_points_idx': points_in_view}
+                        self.result_ready.emit(result)
+                        self.task_queue.task_done()
+                        continue
+
+                    # For larger datasets, apply downsampling
+                    point_count = len(points_in_view)
+
+                    # Choose downsampling strategy based on point count
+                    if point_count > 20000:
+                        # Very aggressive downsampling for huge datasets
+                        # Just use random sampling for speed
+                        rng = numpy.random.default_rng()
+                        sample_size = min(10000, int(point_count * 0.1))
+                        indices = rng.choice(len(points_in_view), size=sample_size, replace=False)
+                        filtered_points = points_in_view[indices]
+                    elif point_count > 10000:
+                        # Use grid-based filtering with larger cells
+                        filtered_points = self._grid_filter(points_in_view, x, y, x_range, y_range, cell_factor=15.0)
+                    elif point_count > 5000:
+                        # Medium-sized dataset
+                        filtered_points = self._grid_filter(points_in_view, x, y, x_range, y_range, cell_factor=10.0)
+                    else:
+                        # Smaller dataset
+                        filtered_points = self._grid_filter(points_in_view, x, y, x_range, y_range, cell_factor=5.0)
+
+                    # Send results back to the main thread
+                    result = {'visible_points_idx': filtered_points}
+                    self.result_ready.emit(result)
+
+                except Exception as e:
+                    print(f"Error in optimization worker: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Mark task as done
+                self.task_queue.task_done()
+
+            except Exception as e:
+                print(f"Error in worker thread: {e}")
+
+    def _grid_filter(self, points_in_view, x, y, x_range, y_range, cell_factor=5.0):
+        """Filter points using a grid-based approach in data space"""
+        # Get x and y data for points in view
+        x_filtered = x[points_in_view]
+        y_filtered = y[points_in_view]
+
+        # Calculate grid cell size based on view range
+        x_min, x_max = x_range
+        y_min, y_max = y_range
+
+        # Compute data-to-screen scale factors (approximate)
+        x_range_size = x_max - x_min
+        y_range_size = y_max - y_min
+
+        # Use cell factor to control grid density
+        # Higher factor = fewer points (faster but less detail)
+        cell_size_x = (x_range_size / 1000) * cell_factor
+        cell_size_y = (y_range_size / 1000) * cell_factor
+
+        # Apply grid-based filtering
+        mask = numpy.ones(len(points_in_view), dtype=bool)
+        grid = {}
+
+        for i in range(len(x_filtered)):
+            # Integer division for grid cell assignment
+            cell_x = int(x_filtered[i] / cell_size_x)
+            cell_y = int(y_filtered[i] / cell_size_y)
+            cell_key = (cell_x, cell_y)
+
+            if cell_key in grid:
+                mask[i] = False
+            else:
+                grid[cell_key] = i
+
+        # Return the filtered points
+        return points_in_view[mask]
+
+    def stop(self):
+        """Stop the worker thread"""
+        self.running = False
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+
+# Shared worker instance that can be reused across all Measures instances
+_SHARED_WORKER = None
+
+
+def get_worker():
+    """Get or create the shared worker instance"""
+    global _SHARED_WORKER
+    if _SHARED_WORKER is None or not _SHARED_WORKER.running:
+        _SHARED_WORKER = OptimizationWorker()
+    return _SHARED_WORKER
+
+
 class Measures(pyqtgraph.ScatterPlotItem):
     def __init__(self, x, y, data: dict = None, ax=None, fig=None, name="", unit=""):
+        # Initialize scatter plot first
+        super().__init__(
+            hoverable=True,
+            hoverSymbol="s",
+            hoverSize=10,
+            hoverPen=pyqtgraph.mkPen("w", width=1)
+        )
+
+        # Initialize our instance attributes
         self.x = x
         self.y = y
         self.data_points = {} if data is None else data.copy()
@@ -40,7 +212,20 @@ class Measures(pyqtgraph.ScatterPlotItem):
         # Data for point optimization
         self.all_points_idx = numpy.arange(len(self.x))
         self.visible_points_idx = self.all_points_idx  # Initially all points are visible
-        self.min_distance = 5.0  # Minimum pixel distance between points
+
+        # Thread-related attributes
+        self._last_view_range = None
+        self._optimization_pending = False
+        self._last_update_time = time.time()
+        self._debounce_timeout = 100  # ms
+        self._debounce_timer = QtCore.QTimer()
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.timeout.connect(self._do_schedule_optimization)
+
+        # Get worker and connect to its signal
+        self._worker = get_worker()
+        self._worker.set_measures(self)
+        self._worker.result_ready.connect(self._apply_optimization_results)
 
         # Set up color mapping
         self.cb = pyqtgraph.HistogramLUTItem(orientation='horizontal', gradientPosition=None, levelMode="mono")
@@ -49,18 +234,14 @@ class Measures(pyqtgraph.ScatterPlotItem):
         # Set up histogram bins
         self.set_bins()
 
-        # Initialize scatter plot
-        super().__init__(
+        # Update the data for scatter plot
+        self.setData(
             x=self.x,
             y=self.y,
             data=numpy.array(range(len(self.x))),
             tip=lambda x, y, data: self.tooltip(x, y, data),
             pen=None,
-            brush=[pyqtgraph.mkBrush(color) for color in self.colormap.mapToQColor(self.data_points[self.color_key])],
-            hoverable=True,
-            hoverSymbol="s",
-            hoverSize=10,
-            hoverPen=pyqtgraph.mkPen("w", width=1)
+            brush=[pyqtgraph.mkBrush(color) for color in self.colormap.mapToQColor(self.data_points[self.color_key])]
         )
 
         # Complete initialization
@@ -134,124 +315,66 @@ class Measures(pyqtgraph.ScatterPlotItem):
         self.fig.nextRow()
         self.fig.addItem(self.cb)
 
+        # Initial point optimization
+        self._do_schedule_optimization()
+
     def on_view_changed(self, view_box, range_change):
         """Called when the view range changes (zoom/pan)"""
-        # Get the current view ranges
-        view_range = view_box.viewRange()
+        # Use Qt timer for debouncing (delay execution until user stops changing view)
+        if self._debounce_timer.isActive():
+            self._debounce_timer.stop()
 
-        # Cancel any pending optimization timer
-        if hasattr(self, '_optimization_timer'):
-            self._optimization_timer.stop()
+        # Restart timer
+        self._debounce_timer.start(self._debounce_timeout)
 
-        # Use a longer delay (300ms instead of 100ms) to avoid recalculating during continuous panning
-        self._optimization_timer = QtCore.QTimer()
-        self._optimization_timer.setSingleShot(True)
-        self._optimization_timer.timeout.connect(lambda: self.optimize_visible_points(view_range))
-        self._optimization_timer.start(300)  # Increased delay for better performance
+        # During active dragging/zooming, use a simplified representation
+        # This gives immediate visual feedback while keeping the UI responsive
+        if len(self.visible_points_idx) > 10000:
+            # Use random sampling for temporary view during drag
+            rng = numpy.random.default_rng()
+            temp_indices = rng.choice(len(self.visible_points_idx), size=5000, replace=False)
+            temp_visible = self.visible_points_idx[temp_indices]
+            self._update_points_display(temp_visible)
 
-    def optimize_visible_points(self, view_range):
-        """Optimize which points to display based on current view"""
+    def _do_schedule_optimization(self):
+        """Actually schedule the optimization after debounce timeout"""
+        view_range = self.ax.vb.viewRange()
+
+        # Don't reschedule if view hasn't changed
+        if (self._last_view_range is not None and
+                numpy.allclose(view_range[0], self._last_view_range[0]) and
+                numpy.allclose(view_range[1], self._last_view_range[1])):
+            return
+
+        # Update last view range
+        self._last_view_range = view_range
+
+        # Flag that optimization is pending
+        self._optimization_pending = True
+
+        # Add task to worker queue
+        self._worker.add_task(view_range)
+
+    def _apply_optimization_results(self, result):
+        """Apply the optimization results from the worker thread (runs in UI thread)"""
         try:
-            # Extract view boundaries
-            x_range, y_range = view_range
-            x_min, x_max = x_range
-            y_min, y_max = y_range
-
-            # Filter points that are within view bounds
-            in_view = (
-                    (self.x >= x_min) & (self.x <= x_max) &
-                    (self.y >= y_min) & (self.y <= y_max)
-            )
-            points_in_view = self.all_points_idx[in_view]
-
-            # If very few points, show all of them
-            if len(points_in_view) < 500:
-                self.visible_points_idx = points_in_view
-                self.update_visible_points()
-                return
-
-            # If number of points is reasonable, show them all
-            if len(points_in_view) < 3000:
-                self.visible_points_idx = points_in_view
-                self.update_visible_points()
-                return
-
-            # For very large datasets, use a more aggressive downsampling
-            # Calculate a dynamic min_distance based on point count
-            point_count = len(points_in_view)
-            if point_count > 10000:
-                # More aggressive for very large datasets
-                self.min_distance = 10.0
-            elif point_count > 5000:
-                self.min_distance = 7.0
-            else:
-                self.min_distance = 5.0
-
-            # If dataset is extremely large, do a simple random sampling first
-            if point_count > 15000:
-                # Take a random subset (20%) for extremely large datasets
-                rng = numpy.random.default_rng()
-                random_indices = rng.choice(len(points_in_view), size=int(len(points_in_view) * 0.2), replace=False)
-                points_in_view = points_in_view[random_indices]
-
-            # Map data coordinates to screen coordinates (only for the subset if used)
-            x_filtered = self.x[points_in_view]
-            y_filtered = self.y[points_in_view]
-
-            # Use vectorized operations to convert coordinates where possible
-            # or batch the coordinate conversion
-            screen_points = []
-            batch_size = 1000  # Process in batches to reduce overhead
-
-            for i in range(0, len(x_filtered), batch_size):
-                batch_end = min(i + batch_size, len(x_filtered))
-                batch_points = []
-
-                for j in range(i, batch_end):
-                    screen_point = self.ax.vb.mapFromView(QtCore.QPointF(x_filtered[j], y_filtered[j]))
-                    batch_points.append((screen_point.x(), screen_point.y()))
-
-                screen_points.extend(batch_points)
-
-            # Apply grid-based filtering
-            coords = numpy.array(screen_points)
-            mask = numpy.ones(len(points_in_view), dtype=bool)
-            cell_size = self.min_distance
-            grid = {}
-
-            for i, (x, y) in enumerate(coords):
-                cell_x = int(x / cell_size)
-                cell_y = int(y / cell_size)
-                cell_key = (cell_x, cell_y)
-
-                if cell_key in grid:
-                    mask[i] = False
-                else:
-                    grid[cell_key] = i
-
-            # Apply the mask to get the visible points
-            self.visible_points_idx = points_in_view[mask]
-
-            # Update plot with only the visible points
-            self.update_visible_points()
-
+            self.visible_points_idx = result['visible_points_idx']
+            self._update_points_display(self.visible_points_idx)
+            self._optimization_pending = False
             print(f"Showing {len(self.visible_points_idx)} of {len(self.x)} points")
-
         except Exception as e:
-            print(f"Error in optimize_visible_points: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"Error applying optimization results: {e}")
 
-    def update_visible_points(self):
-        """Update the scatter plot to show only the visible points"""
+    def _update_points_display(self, visible_indices):
+        """Update just the display data without recalculating visibility"""
         try:
             # Extract visible points data
-            visible_x = self.x[self.visible_points_idx]
-            visible_y = self.y[self.visible_points_idx]
+            visible_x = self.x[visible_indices]
+            visible_y = self.y[visible_indices]
 
             # Get the color data for visible points
             color_data = self.data_points[self.color_key]
-            visible_colors = color_data[self.visible_points_idx]
+            visible_colors = color_data[visible_indices]
 
             # Get current color levels
             min_level, max_level = self.cb.getLevels()
@@ -262,23 +385,39 @@ class Measures(pyqtgraph.ScatterPlotItem):
             else:
                 normalized = numpy.zeros_like(visible_colors)
 
-            # Map to colors
-            colors = [pyqtgraph.mkBrush(color) for color in
-                      self.colormap.map(normalized, mode='qcolor')]
+            # Map to colors - do this in batches for large datasets
+            if len(visible_indices) > 10000:
+                # For large datasets, use a faster approach with numpy vectorization
+                # Convert colormap to numpy array for faster processing
+                cmap_array = numpy.array(
+                    [c.getRgb() for c in self.colormap.map(numpy.linspace(0, 1, 256), mode='qcolor')])
 
-            # Update scatter plot data with original indices stored properly
-            # Convert indices to integer to avoid any type issues
-            data_indices = [int(idx) for idx in self.visible_points_idx]
+                # Map normalized values to colormap indices
+                color_indices = numpy.clip((normalized * 255).astype(int), 0, 255)
+
+                # Get colors from colormap
+                colors = [pyqtgraph.mkBrush(*cmap_array[idx]) for idx in color_indices]
+            else:
+                # For smaller datasets, use the standard approach
+                colors = [pyqtgraph.mkBrush(color) for color in
+                          self.colormap.map(normalized, mode='qcolor')]
+
+            # Update scatter plot data - use integers for the data indices
+            data_indices = [int(idx) for idx in visible_indices]
             self.setData(
                 x=visible_x,
                 y=visible_y,
-                data=data_indices,  # Use the index in the original dataset as data
+                data=data_indices,
                 brush=colors
             )
         except Exception as e:
-            print(f"Error in update_visible_points: {e}")
+            print(f"Error updating points display: {e}")
             import traceback
             traceback.print_exc()
+
+    def update_visible_points(self):
+        """Update the scatter plot to show only the visible points"""
+        self._update_points_display(self.visible_points_idx)
 
     def tooltip(self, x, y, data):
         """Generate tooltip text for hover events"""
@@ -454,3 +593,18 @@ class Measures(pyqtgraph.ScatterPlotItem):
 
         # Always accept the event to ensure it's processed
         ev.accept()
+
+    def cleanup(self):
+        """Clean up resources when the plot is closed"""
+        # Stop debounce timer
+        if self._debounce_timer.isActive():
+            self._debounce_timer.stop()
+
+
+# Function to clean up the worker when the application exits
+def cleanup_worker():
+    """Clean up the shared worker when the application exits"""
+    global _SHARED_WORKER
+    if _SHARED_WORKER is not None:
+        _SHARED_WORKER.stop()
+        _SHARED_WORKER = None

@@ -6,12 +6,6 @@ from measure import Measures
 
 
 def generate_random_data(num_points=10000, noise_level=0.05):
-    """Generate high-density altimetry data for testing the Measures class
-
-    Creates a terrain-like surface with 1 million points by default.
-    The data simulates an altimetry survey with measured and synthetic values.
-    Uses non-uniform spacing between points to simulate realistic survey data.
-    """
     # Define survey area dimensions
     x_range = 5000  # 5km range
     y_range = 5000  # 5km range
@@ -176,7 +170,7 @@ def generate_random_data(num_points=10000, noise_level=0.05):
     else:
         print(f"Using full dataset: {len(x)} points")
 
-    return x, y, z
+    return x, y, z, c
 
 
 def main():
@@ -189,7 +183,7 @@ def main():
     win.resize(800, 600)
 
     # Generate random data
-    x, y, z = generate_random_data()
+    x, y, z, c = generate_random_data()
 
     # Create a plot area for the data points
     plot_area = win.addPlot(title="Magnetic Survey Visualization")
@@ -200,7 +194,7 @@ def main():
     measures_plot = Measures(
         x=x,
         y=y,
-        data={"bla": z},
+        data={"z": z, "c": c},
         fig=win,
         ax=plot_area,
         name="Field Intensity",

@@ -1,10 +1,17 @@
 import pyqtgraph
 import numpy
 import utils
+import scipy.interpolate
+
+# Check if bezier module is available
+try:
+    import bezier
+except ImportError:
+    print("Warning: bezier module not available, bezier smoothing will not work")
 
 
 class Slice:
-    """A class to visualize a slice through data"""
+    """A class to visualize a slice through data as a single plot with line-linked data"""
 
     def __init__(self, data):
         self.data_points = data
@@ -12,19 +19,12 @@ class Slice:
         # Get coordinates
         self.x = data.get('x', None)
         self.y = data.get('y', None)
-        self.z = data.get('z', numpy.zeros_like(self.x) if self.x is not None else None)
 
         # Ensure we have valid x and y coordinates
         if self.x is None or self.y is None:
             raise ValueError("Slice requires 'x' and 'y' coordinates in data")
 
-        # Calculate curvilinear abscissa if we have coordinates
-        if self.z is None:
-            # Use flat z=0 if not provided
-            self.z = numpy.zeros_like(self.x)
-
-        # Calculate distance along the path
-        self.a = utils.curviligne_abs(numpy.array([self.x, self.y, self.z]).T)
+        self.a = utils.curviligne_abs(numpy.array([self.x, self.y]).T)
 
         # Add abscissa to data
         self.data_points['a'] = self.a
@@ -47,9 +47,15 @@ class Slice:
         self.ax.showGrid(x=True, y=True, alpha=1)
 
     def create_plots(self):
-        """Create plots for all data fields"""
+        """Create plots for all data fields with lines instead of scatter points"""
         # Skip these fields as they're used for coordinates
-        skip_fields = ['x', 'y', 'z', 'a']
+        skip_fields = ['x', 'y', 'a']
+
+        # Import the smoothing functions from utils if they don't exist in the global namespace
+        # This ensures we have access to the smoothing methods
+        for smooth_method in ['bezier_pipe', 'akima_pipe', 'spline_pipe', 'spline_smooth_pipe']:
+            if smooth_method not in globals() and hasattr(utils, smooth_method):
+                globals()[smooth_method] = getattr(utils, smooth_method)
 
         # Plot all numeric data fields
         color_index = 0
@@ -63,33 +69,32 @@ class Slice:
                     color = self.color_cycle[color_index % len(self.color_cycle)]
                     color_index += 1
 
-                    # Create scatter plot for raw data
-                    scatter = pyqtgraph.ScatterPlotItem(
-                        x=self.a,
-                        y=values,
-                        pen=pyqtgraph.mkPen(color),
-                        brush=pyqtgraph.mkBrush(color),
-                        name=f"{key}"
-                    )
-                    self.ax.addItem(scatter)
-                    self.plots[key] = scatter
-
-                    # Try to create smoothed line
+                    # Try to create smoothed line if needed
                     try:
-                        # Use smooth_pipe function if available
-                        if 'smooth_pipe' in globals():
-                            a_smooth, values_smooth = utils.smooth_pipe(
-                                numpy.array([self.a, values]).T, method="convolve_fft"
-                            ).T
+                        # Use smooth_pipe function with a different method
+                        if hasattr(utils, 'smooth_pipe'):
+                            # Try different smoothing methods in order of preference
+                            smoothing_methods = ["akima", "spline", "bezier", "spline_smooth"]
 
-                            # Create plot line
-                            line = self.ax.plot(
+                            for method in smoothing_methods:
+                                try:
+                                    a_smooth, values_smooth = utils.smooth_pipe(
+                                        numpy.array([self.a, values]).T, method=method
+                                    ).T
+                                    print(f"Successfully used '{method}' smoothing for '{key}'")
+                                    break
+                                except Exception as e:
+                                    print(f"Method '{method}' failed for '{key}': {e}")
+                                    continue
+
+                            # Create smooth plot line
+                            smooth_line = self.ax.plot(
                                 x=a_smooth,
                                 y=values_smooth,
-                                pen=color,
+                                pen=pyqtgraph.mkPen(color, width=2, style=pyqtgraph.QtCore.Qt.DashLine),
                                 name=f"{key} Smooth"
                             )
-                            self.smooth_plots[key] = line
+                            self.smooth_plots[key] = smooth_line
                             print(f"Created smooth line for '{key}'")
                     except Exception as e:
                         print(f"Warning: Could not create smooth line for '{key}': {e}")
@@ -97,5 +102,28 @@ class Slice:
                 except Exception as e:
                     print(f"Warning: Could not plot '{key}': {e}")
 
+    def update_data(self, data):
+        """Update the plot with new data"""
+        self.data_points = data
 
+        # Update coordinates
+        self.x = data.get('x', None)
+        self.y = data.get('y', None)
 
+        if self.x is None or self.y is None:
+            raise ValueError("Slice requires 'x' and 'y' coordinates in data")
+
+        self.a = utils.curviligne_abs(numpy.array([self.x, self.y]).T)
+        self.data_points['a'] = self.a
+
+        # Clear existing plots
+        self.ax.clear()
+        self.legend = self.ax.addLegend()
+
+        # Recreate plots
+        self.plots = {}
+        self.smooth_plots = {}
+        self.create_plots()
+
+        # Update grid
+        self.ax.showGrid(x=True, y=True, alpha=1)
