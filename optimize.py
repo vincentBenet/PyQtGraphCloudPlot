@@ -3,6 +3,7 @@ from pyqtgraph.Qt import QtCore
 import threading
 import queue
 import weakref
+import time  # Add time module for timestamps
 
 
 class OptimizationWorker(QtCore.QObject):
@@ -32,7 +33,15 @@ class OptimizationWorker(QtCore.QObject):
                 self.task_queue.task_done()
             except queue.Empty:
                 break
-        self.task_queue.put(view_range)
+
+        # Add the new task with higher priority
+        # Include a timestamp to identify newer tasks
+        task = {
+            'view_range': view_range,
+            'timestamp': time.time(),
+            'priority': 10  # Higher number = higher priority
+        }
+        self.task_queue.put(task)
 
     def add_repaint_task(self, task):
         """Add a repaint task to the queue with higher priority"""
@@ -61,7 +70,7 @@ class OptimizationWorker(QtCore.QObject):
             try:
                 # Get task with timeout to allow checking running flag periodically
                 try:
-                    task = self.task_queue.get(timeout=self.response_time/1000)
+                    task = self.task_queue.get(timeout=self.response_time / 1000)
                 except queue.Empty:
                     continue
 
@@ -106,14 +115,17 @@ class OptimizationWorker(QtCore.QObject):
                         )
                         points_in_view = all_points_idx[in_view]
 
-                        if len(points_in_view) < self.sample_size:
+                        # Use the current sample_size value which can be changed by sliders
+                        current_sample_size = self.sample_size
+
+                        if len(points_in_view) <= current_sample_size:
                             result = {'visible_points_idx': points_in_view}
                             self.result_ready.emit(result)
                             self.task_queue.task_done()
                             continue
 
                         rng = numpy.random.default_rng(seed=0)
-                        indices = rng.choice(len(points_in_view), size=self.sample_size, replace=False)
+                        indices = rng.choice(len(points_in_view), size=current_sample_size, replace=False)
                         filtered_points = points_in_view[indices]
 
                         # Send results back to the main thread
@@ -135,7 +147,8 @@ class OptimizationWorker(QtCore.QObject):
         """Stop the worker thread"""
         self.running = False
         if self.thread.is_alive():
-            self.thread.join(timeout=self.response_time/1000)
+            self.thread.join(timeout=self.response_time / 1000)
+
 
 _SHARED_WORKER = None
 

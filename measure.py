@@ -1,14 +1,62 @@
+import sys
 import pyqtgraph
 import numpy
-from pyqtgraph.Qt import QtCore
+from PyQt5 import QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui
 import time
 
+# Imports from your existing code
 import optimize
 import slice
 
 
+# Custom QWidget that contains a slider with a label
+class LabeledSlider(QtWidgets.QWidget):
+    valueChanged = QtCore.Signal(int)
+    sliderReleased = QtCore.Signal(int)
+
+    def __init__(self, title, min_val, max_val, value, step=1, parent=None):
+        super().__init__(parent)
+        self.setLayout(QtWidgets.QVBoxLayout())
+
+        # Create label with current value display
+        self.label = QtWidgets.QLabel(f"{title}: {value}")
+        self.layout().addWidget(self.label)
+
+        # Create horizontal slider
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.slider.setMinimum(min_val)
+        self.slider.setMaximum(max_val)
+        self.slider.setValue(value)
+        self.slider.setSingleStep(step)
+        self.slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
+        self.slider.setTickInterval((max_val - min_val) // 10)
+        self.layout().addWidget(self.slider)
+
+        # Connect slider's signals
+        self.slider.valueChanged.connect(self.handleValueChanged)
+        self.slider.sliderReleased.connect(self.handleSliderReleased)
+
+        # Set a fixed width for the widget to make it suitable for a menu
+        self.setFixedWidth(300)
+        self.setFixedHeight(80)
+
+    def handleValueChanged(self, value):
+        # Update the label text with the new value
+        self.label.setText(f"{self.label.text().split(':')[0]}: {value}")
+        # Emit our own valueChanged signal
+        self.valueChanged.emit(value)
+
+    def handleSliderReleased(self):
+        # Emit sliderReleased signal with current value when slider is released
+        self.sliderReleased.emit(self.slider.value())
+
+    def value(self):
+        return self.slider.value()
+
+
 class Measures(pyqtgraph.ScatterPlotItem):
-    def __init__(self, x, y, data: dict = None, ax=None, fig=None, name="", unit="", sample_size=2000, response_time=100):
+    def __init__(self, x, y, data, name, sample_size, response_time, ax=None, fig=None):
         super().__init__(
             hoverable=True,
             hoverSymbol="s",
@@ -36,9 +84,16 @@ class Measures(pyqtgraph.ScatterPlotItem):
 
         # Initialize plot elements
         self.fig = fig
-        self.ax = ax if ax is not None else self.fig.addPlot()
+        self.ax = ax
+        if self.ax is None:
+            if self.fig is not None:
+                self.ax = self.fig.addPlot()
+            else:
+                pyqtgraph.setConfigOptions(antialias=True)
+                self.fig = pyqtgraph.GraphicsLayoutWidget(show=True)
+                self.ax = self.fig.addPlot()
+
         self.name = lambda: name
-        self.unit = unit
         self.lines = []
         self.lines_values = []
         self.slice = []
@@ -81,6 +136,115 @@ class Measures(pyqtgraph.ScatterPlotItem):
         # Complete initialization
         self.init()
 
+    def contextMenuEvent(self, event):
+        """Handle right-click to show context menu with sliders"""
+        # If currently in a drag operation for slicing, don't show context menu
+        if hasattr(self, '_mouseDragging') and self._mouseDragging:
+            return
+
+        # Get the existing context menu from the parent class
+        # First check if ScatterPlotItem has a contextMenu method
+        parent_menu = None
+        if hasattr(super(), "getContextMenus"):
+            parent_menu = QtWidgets.QMenu()
+            menus = super().getContextMenus(event)  # Pass the event parameter
+            if menus:
+                for menu in menus:
+                    parent_menu.addMenu(menu)
+
+        # Create our custom menu
+        menu = parent_menu if parent_menu else QtWidgets.QMenu()
+
+        # Add a separator before our sliders if there are existing menu items
+        if not menu.isEmpty():
+            menu.addSeparator()
+
+        # Add a submenu for our configuration options
+        config_menu = QtWidgets.QMenu("Configuration")
+        menu.addMenu(config_menu)
+
+        # Create custom widget actions for sliders
+        sample_size_action = QtWidgets.QWidgetAction(config_menu)
+        response_time_action = QtWidgets.QWidgetAction(config_menu)
+
+        # Create slider widgets
+        sample_slider = LabeledSlider("Sample Size", 100, 10000, self.sample_size, 100)
+        time_slider = LabeledSlider("Response Time (ms)", 10, 1000, self.response_time, 10)
+
+        # Set the widgets for the actions
+        sample_size_action.setDefaultWidget(sample_slider)
+        response_time_action.setDefaultWidget(time_slider)
+
+        # Add actions to the config menu
+        config_menu.addAction(sample_size_action)
+        config_menu.addAction(response_time_action)
+
+        # Connect sliders to update functions - update on release for performance
+        sample_slider.sliderReleased.connect(lambda value: self.update_sample_size(value, True))
+        time_slider.sliderReleased.connect(self.update_response_time)
+
+        # Connect valueChanged to update UI without triggering graph redraw
+        sample_slider.valueChanged.connect(lambda value: self.update_sample_size(value, False))
+
+        # Add a separator and reset option
+        config_menu.addSeparator()
+        reset_action = config_menu.addAction("Reset to Defaults")
+        reset_action.triggered.connect(lambda: self.reset_parameters(sample_slider, time_slider))
+
+        # Show the menu at the event position
+        menu.exec_(event.screenPos())
+
+    def update_sample_size(self, value, trigger_update=True):
+        """Update the sample size parameter"""
+        # Update the sample size parameter
+        self.sample_size = value
+        # Update the worker's sample size
+        self._worker.sample_size = value
+        print(f"Sample size updated to: {value}")
+
+        # For immediate feedback, force a resampling of points
+        if trigger_update:
+            # Get current view range
+            view_range = self.ax.vb.viewRange()
+            # Clear any existing optimization tasks
+            self._optimization_pending = False
+            if self._debounce_timer.isActive():
+                self._debounce_timer.stop()
+
+            # Force the worker to process a new task immediately with the updated sample size
+            self._worker.add_task(view_range)
+
+            # Reset optimization pending flag to ensure next scheduled task is processed
+            self._last_view_range = None
+
+    def update_response_time(self, value):
+        """Update the response time parameter"""
+        self.response_time = value
+        # Update the worker's response time
+        self._worker.response_time = value
+        # Update the debounce timeout
+        self._debounce_timeout = value
+        print(f"Response time updated to: {value}ms")
+        # Trigger a repaint to ensure the changes are visible
+        self.repaint()
+
+    def reset_parameters(self, sample_slider, time_slider):
+        """Reset parameters to default values"""
+        # Default values (you can adjust these)
+        default_sample_size = 1000
+        default_response_time = 100
+
+        # Update time slider first (less impactful change)
+        time_slider.slider.setValue(default_response_time)
+        self.update_response_time(default_response_time)
+
+        # Update sample slider and force immediate update
+        sample_slider.slider.setValue(default_sample_size)
+        self.update_sample_size(default_sample_size, True)
+
+        print(
+            f"Parameters reset to defaults: Sample Size={default_sample_size}, Response Time={default_response_time}ms")
+
     def set_bins(self):
         """Set up histogram bins for the color data"""
         color_data = self.data_points[self.color_key]
@@ -113,8 +277,6 @@ class Measures(pyqtgraph.ScatterPlotItem):
         self.cb.vb.addItem(pyqtgraph.InfiniteLine(pos=numpy.nanpercentile(color_data, 95), angle=90,
                                                   pen=pyqtgraph.mkPen('r'), label="95%"))
 
-        # Set up labels and color map
-        self.cb.axis.setLabel(f"{self.name()} ({self.color_key})", self.unit)
         self.cb.gradient.setColorMap(self.colormap)
 
         # Set initial levels
@@ -130,7 +292,6 @@ class Measures(pyqtgraph.ScatterPlotItem):
             self.cb.setLevels(p05, p95)
         except (ValueError, TypeError) as e:
             print(f"Warning: Could not set percentile levels: {e}")
-        # self.cb.sigLevelChangeFinished.connect(self.repaint)
         self.cb.sigLevelsChanged.connect(self.repaint)
         self.sigHovered.connect(lambda plot_item, indexes, event: self.on_hover(plot_item, indexes, event))
         self.ax.vb.sigRangeChanged.connect(self.on_view_changed)
@@ -331,6 +492,10 @@ class Measures(pyqtgraph.ScatterPlotItem):
         if ev.button() != QtCore.Qt.MouseButton.RightButton:
             return
 
+        # Set flag to track if we're in a drag operation
+        if ev.isStart():
+            self._mouseDragging = True
+
         # Get points at the current mouse position
         points_at_pos = self.pointsAt(ev.pos())
 
@@ -343,6 +508,9 @@ class Measures(pyqtgraph.ScatterPlotItem):
 
         elif ev.isFinish():
             print(f"Drag finished with {len(self.slice)} points in slice")
+            # Reset dragging flag when drag finishes
+            self._mouseDragging = False
+
             if len(self.slice) > 0:
                 # Extract indexes from points in the slice
                 indexes = []

@@ -1,11 +1,8 @@
-import sys
 import numpy as np
-from pyqtgraph.Qt import QtWidgets
-import pyqtgraph as pg
-from measure import Measures
+import main
 
 
-def generate_random_data(num_points=1000000, noise_level=0.1):
+def generate_random_data(num_points=1000000, noise_level=1):
     x_range = 10000
     y_range = 10000
     points_to_generate = int(num_points)
@@ -168,43 +165,11 @@ def generate_random_data(num_points=1000000, noise_level=0.1):
     return x, y, z, c
 
 
-def main():
-    # Initialize PyQtGraph
-    app = QtWidgets.QApplication(sys.argv)
-    pg.setConfigOptions(antialias=True)
-
-    # Create a window with a GraphicsLayoutWidget
-    win = pg.GraphicsLayoutWidget(show=True, title="Measures Test Example")
-    win.resize(800, 600)
-
-    # Generate random data
+if __name__ == "__main__":
     x, y, z, c = generate_random_data()
-
-    # Create a plot area for the data points
-    plot_area = win.addPlot(title="Magnetic Survey Visualization")
-    plot_area.setLabel('bottom', 'X', 'm')
-    plot_area.setLabel('left', 'Y', 'm')
-
-    # Create Measures object
-    measures_plot = Measures(
+    main.main(
         x=x,
         y=y,
         data={"z": z, "c": c},
-        fig=win,
-        ax=plot_area,
-        name="Field Intensity",
-        unit="nT"
+        name="Data",
     )
-
-    # Display instructions
-    print("Interactive Visualization Instructions:")
-    print("- Hover over points to see detailed information")
-    print("- Right-click and drag to select points for a Slice view")
-    print("- Adjust color scale in the histogram")
-
-    # Start Qt event loop
-    sys.exit(app.exec_())
-
-
-if __name__ == "__main__":
-    main()
