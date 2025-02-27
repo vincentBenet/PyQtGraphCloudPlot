@@ -8,51 +8,7 @@ import time
 # Imports from your existing code
 import optimize
 import slice
-
-
-# Custom QWidget that contains a slider with a label
-class LabeledSlider(QtWidgets.QWidget):
-    valueChanged = QtCore.Signal(int)
-    sliderReleased = QtCore.Signal(int)
-
-    def __init__(self, title, min_val, max_val, value, step=1, parent=None):
-        super().__init__(parent)
-        self.setLayout(QtWidgets.QVBoxLayout())
-
-        # Create label with current value display
-        self.label = QtWidgets.QLabel(f"{title}: {value}")
-        self.layout().addWidget(self.label)
-
-        # Create horizontal slider
-        self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.slider.setMinimum(min_val)
-        self.slider.setMaximum(max_val)
-        self.slider.setValue(value)
-        self.slider.setSingleStep(step)
-        self.slider.setTickPosition(QtWidgets.QSlider.TicksBelow)
-        self.slider.setTickInterval((max_val - min_val) // 10)
-        self.layout().addWidget(self.slider)
-
-        # Connect slider's signals
-        self.slider.valueChanged.connect(self.handleValueChanged)
-        self.slider.sliderReleased.connect(self.handleSliderReleased)
-
-        # Set a fixed width for the widget to make it suitable for a menu
-        self.setFixedWidth(300)
-        self.setFixedHeight(80)
-
-    def handleValueChanged(self, value):
-        # Update the label text with the new value
-        self.label.setText(f"{self.label.text().split(':')[0]}: {value}")
-        # Emit our own valueChanged signal
-        self.valueChanged.emit(value)
-
-    def handleSliderReleased(self):
-        # Emit sliderReleased signal with current value when slider is released
-        self.sliderReleased.emit(self.slider.value())
-
-    def value(self):
-        return self.slider.value()
+import slider
 
 
 class Measures(pyqtgraph.ScatterPlotItem):
@@ -136,30 +92,29 @@ class Measures(pyqtgraph.ScatterPlotItem):
         # Complete initialization
         self.init()
 
-    def contextMenuEvent(self, event):
-        """Handle right-click to show context menu with sliders"""
-        # If currently in a drag operation for slicing, don't show context menu
-        if hasattr(self, '_mouseDragging') and self._mouseDragging:
-            return
+    def mousePressEvent(self, ev):
+        """
+        Override mousePressEvent to intercept right clicks before they trigger context menus
+        """
+        # If it's a right-click, handle it here
+        if ev.button() == QtCore.Qt.MouseButton.RightButton:
+            # Block the event from propagating further
+            ev.accept()
 
-        # Get the existing context menu from the parent class
-        # First check if ScatterPlotItem has a contextMenu method
-        parent_menu = None
-        if hasattr(super(), "getContextMenus"):
-            parent_menu = QtWidgets.QMenu()
-            menus = super().getContextMenus(event)  # Pass the event parameter
-            if menus:
-                for menu in menus:
-                    parent_menu.addMenu(menu)
+            # Call our custom method to show the context menu
+            self.showCustomContextMenu(ev)
+        else:
+            # For all other mouse buttons, let the parent class handle it
+            super().mousePressEvent(ev)
 
-        # Create our custom menu
-        menu = parent_menu if parent_menu else QtWidgets.QMenu()
+    def showCustomContextMenu(self, ev):
+        """
+        Show our custom context menu for right-click events
+        """
+        # Create a brand new menu
+        menu = QtWidgets.QMenu()
 
-        # Add a separator before our sliders if there are existing menu items
-        if not menu.isEmpty():
-            menu.addSeparator()
-
-        # Add a submenu for our configuration options
+        # ===== Add our Configuration menu at the very top =====
         config_menu = QtWidgets.QMenu("Configuration")
         menu.addMenu(config_menu)
 
@@ -168,8 +123,8 @@ class Measures(pyqtgraph.ScatterPlotItem):
         response_time_action = QtWidgets.QWidgetAction(config_menu)
 
         # Create slider widgets
-        sample_slider = LabeledSlider("Sample Size", 100, 10000, self.sample_size, 100)
-        time_slider = LabeledSlider("Response Time (ms)", 10, 1000, self.response_time, 10)
+        sample_slider = slider.LabeledSlider("Sample Size", 100, 10000, self.sample_size, 100)
+        time_slider = slider.LabeledSlider("Response Time (ms)", 10, 1000, self.response_time, 10)
 
         # Set the widgets for the actions
         sample_size_action.setDefaultWidget(sample_slider)
@@ -180,8 +135,8 @@ class Measures(pyqtgraph.ScatterPlotItem):
         config_menu.addAction(response_time_action)
 
         # Connect sliders to update functions - update on release for performance
-        sample_slider.sliderReleased.connect(lambda value: self.update_sample_size(value, True))
-        time_slider.sliderReleased.connect(self.update_response_time)
+        sample_slider.sliderReleased.connect(lambda: self.update_sample_size(sample_slider.slider.value(), True))
+        time_slider.sliderReleased.connect(lambda: self.update_response_time(time_slider.slider.value()))
 
         # Connect valueChanged to update UI without triggering graph redraw
         sample_slider.valueChanged.connect(lambda value: self.update_sample_size(value, False))
@@ -191,8 +146,83 @@ class Measures(pyqtgraph.ScatterPlotItem):
         reset_action = config_menu.addAction("Reset to Defaults")
         reset_action.triggered.connect(lambda: self.reset_parameters(sample_slider, time_slider))
 
-        # Show the menu at the event position
-        menu.exec_(event.screenPos())
+        # ===== Now manually add all the standard PyQtGraph plot options =====
+        # View All
+        view_all_action = menu.addAction("View All")
+        view_all_action.triggered.connect(lambda: self.ax.autoRange())
+
+        # X Axis submenu
+        x_menu = QtWidgets.QMenu("X axis")
+        menu.addMenu(x_menu)
+
+        # X axis - Manual Range
+        x_manual_action = x_menu.addAction("Manual Range")
+        x_manual_action.triggered.connect(lambda: self.ax.vb.setMouseMode(pyqtgraph.ViewBox.RectMode))
+
+        # X axis - Auto Range
+        x_auto_action = x_menu.addAction("Auto Range")
+        x_auto_action.triggered.connect(lambda: self.ax.enableAutoRange(axis=pyqtgraph.ViewBox.XAxis))
+
+        # X axis - Auto Pan
+        x_pan_action = x_menu.addAction("Auto Pan")
+        x_pan_action.triggered.connect(lambda: self.ax.enableAutoPan(axis=pyqtgraph.ViewBox.XAxis))
+
+        # X axis - Log Scale
+        x_log_action = x_menu.addAction("Log Scale")
+        x_log_action.setCheckable(True)
+        x_log_action.setChecked(self.ax.getAxis('bottom').logMode)
+        x_log_action.triggered.connect(lambda checked: self.ax.setLogMode(x=checked))
+
+        # Y Axis submenu
+        y_menu = QtWidgets.QMenu("Y axis")
+        menu.addMenu(y_menu)
+
+        # Y axis - Manual Range
+        y_manual_action = y_menu.addAction("Manual Range")
+        y_manual_action.triggered.connect(lambda: self.ax.vb.setMouseMode(pyqtgraph.ViewBox.RectMode))
+
+        # Y axis - Auto Range
+        y_auto_action = y_menu.addAction("Auto Range")
+        y_auto_action.triggered.connect(lambda: self.ax.enableAutoRange(axis=pyqtgraph.ViewBox.YAxis))
+
+        # Y axis - Auto Pan
+        y_pan_action = y_menu.addAction("Auto Pan")
+        y_pan_action.triggered.connect(lambda: self.ax.enableAutoPan(axis=pyqtgraph.ViewBox.YAxis))
+
+        # Y axis - Log Scale
+        y_log_action = y_menu.addAction("Log Scale")
+        y_log_action.setCheckable(True)
+        y_log_action.setChecked(self.ax.getAxis('left').logMode)
+        y_log_action.triggered.connect(lambda checked: self.ax.setLogMode(y=checked))
+
+        # Mouse Mode submenu
+        mouse_menu = QtWidgets.QMenu("Mouse Mode")
+        menu.addMenu(mouse_menu)
+
+        # Mouse Mode - Rectangle Selection
+        rect_action = mouse_menu.addAction("Rectangle Selection")
+        rect_action.triggered.connect(lambda: self.ax.vb.setMouseMode(pyqtgraph.ViewBox.RectMode))
+
+        # Mouse Mode - Pan/Zoom
+        pan_action = mouse_menu.addAction("Pan/Zoom")
+        pan_action.triggered.connect(lambda: self.ax.vb.setMouseMode(pyqtgraph.ViewBox.PanMode))
+
+        # Plot Options submenu
+        plot_menu = QtWidgets.QMenu("Plot Options")
+        menu.addMenu(plot_menu)
+
+        # Plot Options - Grid
+        grid_action = plot_menu.addAction("Grid")
+        grid_action.setCheckable(True)
+        grid_action.setChecked(True)  # Assuming grid is on by default
+        grid_action.triggered.connect(lambda checked: self.ax.showGrid(x=checked, y=checked))
+
+        # Export option
+        export_action = menu.addAction("Export...")
+        export_action.triggered.connect(lambda: pyqtgraph.exportDialog(self.ax))
+
+        # Show the menu at the position of the mouse event
+        menu.exec_(ev.screenPos())
 
     def update_sample_size(self, value, trigger_update=True):
         """Update the sample size parameter"""
