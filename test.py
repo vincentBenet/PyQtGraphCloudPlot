@@ -5,15 +5,10 @@ import pyqtgraph as pg
 from measure import Measures
 
 
-def generate_random_data(num_points=10000, noise_level=0.05):
-    # Define survey area dimensions
-    x_range = 5000  # 5km range
-    y_range = 5000  # 5km range
-
-    # Generate initial points with jittered/non-uniform distribution
-    # We'll generate more points than requested and then sample
-    extra_factor = 1.2  # Generate 20% more points than needed for sampling flexibility
-    points_to_generate = int(num_points * extra_factor)
+def generate_random_data(num_points=1000000, noise_level=0.1):
+    x_range = 10000
+    y_range = 10000
+    points_to_generate = int(num_points)
 
     # Create several "flight lines" with varying density
     num_lines = 200
