@@ -12,7 +12,7 @@ import slider
 
 
 class Measures(pyqtgraph.ScatterPlotItem):
-    def __init__(self, x, y, data, name, sample_size, response_time, ax=None, fig=None):
+    def __init__(self, x, y, data, name, sample_size=1000, response_time=100, ax=None, fig=None):
         super().__init__(
             hoverable=True,
             hoverSymbol="s",
@@ -25,8 +25,24 @@ class Measures(pyqtgraph.ScatterPlotItem):
         self.data_points = {} if data is None else data.copy()
         self.data_points["x"] = x
         self.data_points["y"] = y
-        self.sample_size = sample_size
-        self.response_time = response_time
+        self.name_str = name  # Store name as string for persistence
+
+        # Initialize persistence manager
+        self.persistence = slider.SliderPersistence()
+
+        # Load saved settings if they exist
+        saved_settings = self.persistence.load_settings(name)
+        if saved_settings:
+            # Use saved values if available
+            self.sample_size = saved_settings.get('sample_size', sample_size)
+            self.response_time = saved_settings.get('response_time', response_time)
+            print(
+                f"Loaded saved settings for {name}: sample_size={self.sample_size}, response_time={self.response_time}")
+        else:
+            # Use default values
+            self.sample_size = sample_size
+            self.response_time = response_time
+
         self.color_key = None
         for key, value in self.data_points.items():
             if key not in ['x', 'y'] and isinstance(value, numpy.ndarray) and value.dtype.kind in 'iuf':
@@ -136,9 +152,24 @@ class Measures(pyqtgraph.ScatterPlotItem):
 
         # Connect sliders to update functions - update on release for performance
         sample_slider.sliderReleased.connect(lambda: self.update_sample_size(sample_slider.slider.value(), True))
+        sample_slider.sliderReleased.connect(
+            lambda: self.persistence.save_settings(
+                'Data', {
+                    "sample_size": self.sample_size,
+                    "response_time": self.response_time
+                }
+            )
+        )
         time_slider.sliderReleased.connect(lambda: self.update_response_time(time_slider.slider.value()))
-
-        # Connect valueChanged to update UI without triggering graph redraw
+        time_slider.sliderReleased.connect(
+            lambda: self.persistence.save_settings(
+                'Data', {
+                    "sample_size": self.sample_size,
+                    "response_time": self.response_time
+                }
+            )
+        )
+        # Connect valueChanged to update UI without triggering graph redraw)
         sample_slider.valueChanged.connect(lambda value: self.update_sample_size(value, False))
 
         # Add a separator and reset option
@@ -224,6 +255,29 @@ class Measures(pyqtgraph.ScatterPlotItem):
         # Show the menu at the position of the mouse event
         menu.exec_(ev.screenPos())
 
+    def save_current_settings(self):
+        """Save current slider settings to persistent storage"""
+        settings = {
+            'sample_size': self.sample_size,
+            'response_time': self.response_time
+        }
+
+        success = self.persistence.save_settings(self.name_str, settings)
+        if success:
+            # Show a confirmation message using a message box
+            msg_box = QtWidgets.QMessageBox()
+            msg_box.setIcon(QtWidgets.QMessageBox.Information)
+            msg_box.setText(f"Settings for {self.name_str} saved successfully.")
+            msg_box.setWindowTitle("Settings Saved")
+            msg_box.exec_()
+        else:
+            # Show error message
+            msg_box = QtWidgets.QMessageBox()
+            msg_box.setIcon(QtWidgets.QMessageBox.Warning)
+            msg_box.setText("Failed to save settings.")
+            msg_box.setWindowTitle("Save Error")
+            msg_box.exec_()
+
     def update_sample_size(self, value, trigger_update=True):
         """Update the sample size parameter"""
         # Update the sample size parameter
@@ -274,6 +328,9 @@ class Measures(pyqtgraph.ScatterPlotItem):
 
         print(
             f"Parameters reset to defaults: Sample Size={default_sample_size}, Response Time={default_response_time}ms")
+
+        # Optionally save the default values
+        self.save_current_settings()
 
     def set_bins(self):
         """Set up histogram bins for the color data"""
